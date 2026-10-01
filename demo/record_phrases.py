@@ -37,6 +37,8 @@ Output:
 """
 
 import os
+os.environ.setdefault('GLOG_minloglevel', '2')        # hide MediaPipe info/warning spam
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
 import csv
 import sys
 import time
@@ -338,10 +340,11 @@ def selftest() -> None:
         assert count_takes(d)[1] == 2
         delete_take(d, p1)
         assert count_takes(d)[1] == 1
-        rows = list(csv.reader(open(os.path.join(d, 'index.csv'))))
+        with open(os.path.join(d, 'index.csv')) as fh:          # close files: Windows
+            rows = list(csv.reader(fh))                          # cannot delete open ones
         assert len(rows) == 2 and rows[1][2] == 'hello' and float(rows[1][5]) > 0
-        z = np.load(os.path.join(d, rows[1][0]))
-        assert z['kp'].shape == (30, 543, 3)
+        with np.load(os.path.join(d, rows[1][0])) as z:
+            assert z['kp'].shape == (30, 543, 3)
         q = build_queue(count_takes(d), takes=3, seed=0)
         assert q.count(1) == 2 and q.count(0) == 3 and len(q) == 3 * len(PHRASES) - 1
     print("  ✓")
@@ -362,3 +365,6 @@ if __name__ == '__main__':
         show_stats(a.data, a.takes)
     else:
         record(a.data, a.takes, a.camera)
+        
+        
+        
