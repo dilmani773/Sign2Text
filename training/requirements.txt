@@ -1,0 +1,7 @@
+# Kaggle already has torch, numpy, pandas, scipy, transformers
+torch
+transformers
+numpy
+pandas
+scipy
+sacrebleu

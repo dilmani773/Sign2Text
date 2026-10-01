@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Data and model files (too big for GitHub, keep them on Kaggle / your laptop)
+data/
+*.npz
+*.npy
+*.pt
+*.pth
+
+# Logs and OS files
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
