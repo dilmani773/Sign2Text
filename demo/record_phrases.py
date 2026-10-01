@@ -65,11 +65,11 @@ PHRASES = [
     "goodbye",
     "i don't understand",
     "again please",
-    "where is the bathroom",
-    "i am hungry",
-    "i need water",
+    "I am good",
+    "i understand",
+    "bad",
     "i love you",
-    "i need a doctor",
+    "do you understand?",
 ]
 
 N_POSE, N_FACE, N_HAND = 33, 468, 21
