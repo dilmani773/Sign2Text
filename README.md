@@ -48,7 +48,7 @@ results/    training history and test predictions per run
 
 **Training (Kaggle, GPU T4, Internet on):**
 ```python
-!git clone https://github.com/<your-username>/Sign2Text.git /kaggle/working/code
+!git clone https://github.com/dilmani773/Sign2Text.git /kaggle/working/code
 !pip install -q sacrebleu
 !cd /kaggle/working && python code/training/s2t_phase5_train.py > train_log.txt 2>&1
 ```
