@@ -21,6 +21,14 @@ Train (laptop CPU is fine, from the repo root):
 Compare with no pretraining:
     python training/s2t_demo.py --data data --no-pretrain --out results/demo_scratch.pt
 
+Two signers (each has their own data folder):
+    # unseen-signer test: train on Inaaya, test on the teammate
+    python training/s2t_demo.py --data data --test data_friend
+    # test an already trained model on a folder, no training
+    python training/s2t_demo.py --eval-only results/demo_model.pt --test data_friend
+    # train on both signers
+    python training/s2t_demo.py --data data data_friend
+
 Tests:
     python training/s2t_demo.py --selftest
 """
@@ -195,10 +203,32 @@ def encoder_cfg_from(path: Optional[str]) -> dict:
 # SECTION 3 — DATA
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_takes(data_dir: str) -> Tuple[List[dict], List[str]]:
-    """Read index.csv + npz files. Returns takes and class names (by class_id)."""
+def load_takes(data_dirs, verbose: bool = False) -> Tuple[List[dict], List[str]]:
+    """
+    Read index.csv + npz files from one or more data folders (one folder per
+    signer). Returns takes and class names (by class_id).
+    """
+    if isinstance(data_dirs, str):
+        data_dirs = [data_dirs]
     rows, names = [], {}
-    with open(os.path.join(data_dir, 'index.csv')) as fh:
+    for data_dir in data_dirs:
+        n0 = len(rows)
+        rows += _load_dir(data_dir, names)
+        if verbose:
+            print(f"  {data_dir}: {len(rows) - n0} takes")
+    if not rows:
+        raise SystemExit(f"No takes found in {data_dirs}")
+    classes = [names.get(i, f'class_{i}') for i in range(max(names) + 1)]
+    return rows, classes
+
+
+def _load_dir(data_dir: str, names: dict) -> List[dict]:
+    rows = []
+    index = os.path.join(data_dir, 'index.csv')
+    if not os.path.exists(index):
+        raise SystemExit(f"Missing {index}. Is '{data_dir}' a recording folder?")
+    signer = os.path.basename(os.path.normpath(data_dir))
+    with open(index) as fh:
         for r in csv.DictReader(fh):
             path = os.path.join(data_dir, r['file'].replace('\\', os.sep).replace('/', os.sep))
             if not os.path.exists(path):
@@ -206,10 +236,14 @@ def load_takes(data_dir: str) -> Tuple[List[dict], List[str]]:
             with np.load(path) as z:
                 kp = resample_fps(z['kp'], z['t'])
             cid = int(r['class_id'])
+            if cid in names and names[cid] != r['phrase']:
+                raise SystemExit(f"Class {cid} is '{names[cid]}' in one folder and "
+                                 f"'{r['phrase']}' in {data_dir}. Both signers must use "
+                                 f"the same PHRASES list.")
             names[cid] = r['phrase']
-            rows.append({'kp': kp, 'y': cid, 'session': r['session'], 'file': r['file']})
-    classes = [names.get(i, f'class_{i}') for i in range(max(names) + 1)]
-    return rows, classes
+            rows.append({'kp': kp, 'y': cid, 'session': f"{signer}/{r['session']}",
+                         'signer': signer, 'file': r['file']})
+    return rows
 
 
 def split_takes(takes: List[dict], val_frac: float = 0.2, seed: int = 0):
@@ -217,7 +251,7 @@ def split_takes(takes: List[dict], val_frac: float = 0.2, seed: int = 0):
     Val = the latest session if there are 2+ sessions and it covers every
     class (honest: a different day). Otherwise a random 20% per class.
     """
-    sessions = sorted({t['session'] for t in takes})
+    sessions = sorted({t['session'] for t in takes}, key=lambda x: x.split('/')[-1])   # by time
     if len(sessions) >= 2:
         last = sessions[-1]
         val = [t for t in takes if t['session'] == last]
@@ -262,14 +296,44 @@ def evaluate(model, takes, n_classes, batch=32):
     return float(np.mean(np.array(preds) == np.array(y))), cm
 
 
-def train(data_dir: str, out: str, pretrained: Optional[str], epochs: int = 80,
+def report(model, takes, classes, title: str, log=print) -> float:
+    acc, cm = evaluate(model, takes, len(classes))
+    log(f"\n{title}: {100 * acc:.1f}% of {len(takes)} takes")
+    for i, c in enumerate(classes):
+        tot = cm[i].sum()
+        if tot == 0:
+            continue
+        wrong = [(classes[j], cm[i, j]) for j in np.argsort(-cm[i]) if j != i and cm[i, j] > 0][:2]
+        miss = ', '.join(f"{w} ×{k}" for w, k in wrong)
+        log(f"  {c:22s} {cm[i, i]}/{tot}" + (f"   confused with: {miss}" if miss else ''))
+    return acc
+
+
+def load_model(path: str):
+    ck = torch.load(path, map_location='cpu', weights_only=False)
+    m = PhraseClassifier(len(ck['classes']), ck['encoder_cfg'])
+    m.load_state_dict(ck['model'])
+    m.eval()
+    return m, ck
+
+
+def eval_only(model_path: str, test_dirs) -> float:
+    model, ck = load_model(model_path)
+    takes, classes = load_takes(test_dirs, verbose=True)
+    if classes[:len(ck['classes'])] != ck['classes'][:len(classes)]:
+        raise SystemExit("Phrase list of the test folder does not match the model.")
+    return report(model, takes, ck['classes'], f"Test accuracy on {', '.join(test_dirs)}")
+
+
+def train(data_dir, out: str, pretrained: Optional[str], epochs: int = 80,
           freeze_epochs: int = 10, batch: int = 16, patience: int = 20, seed: int = 0,
-          verbose: bool = True) -> dict:
+          verbose: bool = True, test_dirs=None) -> dict:
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     log = print if verbose else (lambda *a, **k: None)
 
-    takes, classes = load_takes(data_dir)
+    log("Training data:")
+    takes, classes = load_takes(data_dir, verbose=verbose)
     tr, va, how = split_takes(takes, seed=seed)
     n = len(classes)
     log(f"{len(takes)} takes, {n} classes | train {len(tr)} | val {len(va)} ({how})")
@@ -324,16 +388,16 @@ def train(data_dir: str, out: str, pretrained: Optional[str], epochs: int = 80,
     model.load_state_dict(ck['model'])
     acc, cm = evaluate(model, va, n)
     log(f"\nBest val accuracy: {100 * acc:.1f}% (epoch {ck['epoch']}) | {(time.time() - t0) / 60:.1f} min")
-    log("\nPer phrase (val):")
-    for i, c in enumerate(classes):
-        tot = cm[i].sum()
-        if tot == 0:
-            continue
-        wrong = [(classes[j], cm[i, j]) for j in np.argsort(-cm[i]) if j != i and cm[i, j] > 0][:2]
-        miss = ', '.join(f"{w} ×{k}" for w, k in wrong)
-        log(f"  {c:22s} {cm[i, i]}/{tot}" + (f"   confused with: {miss}" if miss else ''))
+    report(model, va, classes, "Validation (per phrase)", log)
+    test_acc = None
+    if test_dirs:
+        log("\nUnseen-signer test data:")
+        test_takes, test_classes = load_takes(test_dirs, verbose=verbose)
+        if test_classes[:n] != classes[:len(test_classes)]:
+            raise SystemExit("Phrase list of the test folder does not match the training data.")
+        test_acc = report(model, test_takes, classes, "Unseen-signer test", log)
     log(f"\nSaved {out}")
-    return {'val_acc': acc, 'confusion': cm, 'classes': classes}
+    return {'val_acc': acc, 'test_acc': test_acc, 'confusion': cm, 'classes': classes}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -415,12 +479,41 @@ def selftest() -> None:
         assert res['val_acc'] >= 0.5, res['val_acc']
         print(f"  val acc {100 * res['val_acc']:.0f}% on fake data, checkpoint reloads ✓")
 
+    print("── Test 5: two signers, unseen-signer test, eval-only, phrase-list check")
+    with tempfile.TemporaryDirectory() as d:
+        def make(folder, n, names=('phrase0', 'phrase1', 'phrase2')):
+            os.makedirs(os.path.join(d, folder, 'x'))
+            with open(os.path.join(d, folder, 'index.csv'), 'w', newline='') as fh:
+                w = csv.writer(fh)
+                w.writerow(['file', 'class_id', 'phrase', 'frames', 'seconds', 'fps', 'hand_pct', 'session'])
+                for c in range(3):
+                    for i in range(n):
+                        kp, t = _fake_take(rng, c)
+                        np.savez(os.path.join(d, folder, 'x', f'c{c}_{i}.npz'), kp=kp, t=t)
+                        w.writerow([f'x\\c{c}_{i}.npz', c, names[c], len(kp), 6, 16.3, 80, 's1'])
+        make('data', 6); make('data_b', 3); make('data_bad', 2, ('phrase0', 'other', 'phrase2'))
+        out = os.path.join(d, 'demo.pt')
+        res = train(os.path.join(d, 'data'), out, None, epochs=8, patience=8, verbose=False,
+                    test_dirs=[os.path.join(d, 'data_b')])
+        assert res['test_acc'] is not None
+        takes, _ = load_takes([os.path.join(d, 'data'), os.path.join(d, 'data_b')])
+        assert len(takes) == 27 and {t['signer'] for t in takes} == {'data', 'data_b'}
+        acc = eval_only(out, [os.path.join(d, 'data_b')])
+        try:
+            load_takes([os.path.join(d, 'data'), os.path.join(d, 'data_bad')])
+            raise AssertionError('mismatch not caught')
+        except SystemExit:
+            pass
+        print(f"  ✓ (test acc {100 * res['test_acc']:.0f}%, eval-only {100 * acc:.0f}%)")
+
     print("\nAll tests PASSED ✓")
 
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
-    ap.add_argument('--data', default='data')
+    ap.add_argument('--data', nargs='+', default=['data'], help='one or more recording folders')
+    ap.add_argument('--test', nargs='+', default=None, help='folders used only for testing (unseen signer)')
+    ap.add_argument('--eval-only', default=None, metavar='MODEL', help='test a trained model, no training')
     ap.add_argument('--pretrained', default='results/run2_weights.pt')
     ap.add_argument('--no-pretrain', action='store_true')
     ap.add_argument('--out', default='results/demo_model.pt')
@@ -429,8 +522,13 @@ if __name__ == '__main__':
     a = ap.parse_args()
     if a.selftest:
         selftest()
+    elif a.eval_only:
+        if not a.test:
+            sys.exit("--eval-only needs --test <folder>")
+        eval_only(a.eval_only, a.test)
     else:
         pre = None if a.no_pretrain else a.pretrained
         if pre and not os.path.exists(pre):
             sys.exit(f"Pretrained weights not found: {pre}\nUse --pretrained <path> or --no-pretrain")
-        train(a.data, a.out, pre, epochs=a.epochs)
+        os.makedirs(os.path.dirname(a.out) or '.', exist_ok=True)
+        train(a.data, a.out, pre, epochs=a.epochs, test_dirs=a.test)

@@ -64,7 +64,16 @@ python demo/record_phrases.py --selftest
 **Recording phrases (laptop with webcam, Python 3.10 to 3.12):**
 ```
 pip install -r demo/requirements.txt
-python demo/record_phrases.py
+python demo/record_phrases.py --data data            # signer 1
+python demo/record_phrases.py --data data_friend     # signer 2, own folder
+```
+
+**Demo classifier and live demo (laptop CPU):**
+```
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+python training/s2t_demo.py --data data --test data_friend     # train on signer 1, test on unseen signer 2
+python training/s2t_demo.py --data data data_friend            # train on both
+python demo/live_demo.py
 ```
 
 ## Author

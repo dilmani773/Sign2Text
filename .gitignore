@@ -5,7 +5,7 @@ __pycache__/
 venv/
 
 # Data and model files (too big for GitHub, keep them on Kaggle / your laptop)
-data/
+data*/
 *.npz
 *.npy
 *.pt

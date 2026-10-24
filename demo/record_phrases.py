@@ -18,10 +18,15 @@ Run:
     python record_phrases.py --selftest      # check the setup, no webcam needed
 
 Keys while recording:
-    SPACE   start signing / stop signing
+    SPACE   start signing (it stops by itself when you lower your hands,
+            or press SPACE again to stop)
     R       redo: delete the last saved take and record it again
     S       skip this phrase for now
     Q       quit (everything saved so far is kept)
+
+Two signers: each person uses their own data folder, e.g.
+    python demo/record_phrases.py --data data            # Inaaya
+    python demo/record_phrases.py --data data_friend      # teammate
 
 Tips:
     - Same framing as How2Sign: whole upper body visible, hands never leave
@@ -78,8 +83,14 @@ LH0 = N_POSE + N_FACE                            # 501
 RH0 = LH0 + N_HAND                               # 522
 
 MIN_FRAMES   = 8       # shorter takes are rejected
-MIN_HAND_PCT = 50.0    # warn if a hand is visible in fewer frames than this
+MIN_UP       = 4       # reject a take with fewer raised-hand frames than this
 MAX_SECONDS  = 6.0     # recording stops by itself after this
+IDLE_SECONDS = 4.0     # length of an "_idle" take
+AUTO_STOP_S  = 0.6     # stop this long after the hands go down (after signing)
+RAISE_LIMIT  = 1.3     # hand is "up" if its wrist is less than this many shoulder
+                       # widths below the shoulders (same rule as training)
+ASPECT       = 16 / 9
+L_SH, R_SH   = 11, 12
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -129,6 +140,39 @@ def hand_pct(kp: np.ndarray) -> float:
     lh = np.abs(kp[:, LH0:RH0]).sum(axis=(1, 2)) > 0
     rh = np.abs(kp[:, RH0:]).sum(axis=(1, 2)) > 0
     return float(100 * (lh | rh).mean()) if len(kp) else 0.0
+
+
+def shoulder_ref(kp: np.ndarray):
+    """Shoulder line y and shoulder width (in frame-height units) from one frame, or None."""
+    ls, rs = kp[L_SH], kp[R_SH]
+    if not (np.abs(ls).sum() > 0 and np.abs(rs).sum() > 0):
+        return None
+    width = float(np.hypot((ls[0] - rs[0]) * ASPECT, ls[1] - rs[1]))
+    return float((ls[1] + rs[1]) / 2), max(width, 1e-3)
+
+
+def hand_raised(kp: np.ndarray, ref) -> bool:
+    """True if a detected hand has its wrist above the resting zone."""
+    if ref is None:
+        return False
+    sh_y, width = ref
+    for w in (LH0, RH0):
+        if np.abs(kp[w:w + N_HAND]).sum() > 0 and kp[w, 1] < sh_y + RAISE_LIMIT * width:
+            return True
+    return False
+
+
+def framing_hint(frame_bgr: np.ndarray, ref) -> str:
+    """One short tip if the camera setup is off, else ''."""
+    if ref is None:
+        return 'shoulders not visible: move back so head to waist is in view'
+    if ref[1] > 0.42:
+        return 'too close: move back from the camera'
+    if ref[1] < 0.15:
+        return 'too far: move a little closer'
+    if float(frame_bgr.mean()) < 70:
+        return 'too dark: add light in front of you'
+    return ''
 
 
 def count_takes(data_dir: str) -> dict:
@@ -208,9 +252,11 @@ def record(data_dir: str, takes: int, camera: int) -> None:
     if not queue:
         print(f"All phrases already have {takes} takes. Use --takes with a higher number.")
         return
+    print(f"Saving to: {os.path.abspath(data_dir)}")
     print(f"{len(queue)} takes to record this session. Press SPACE to start each one.")
 
     state, buf_kp, buf_t, t0 = 'ready', [], [], 0.0
+    ref, seen_up, down_since, n_up = None, False, None, 0
     last_saved, message, msg_until = None, '', 0.0
     fps_t, fps = time.time(), 0.0
 
@@ -225,8 +271,26 @@ def record(data_dir: str, takes: int, camera: int) -> None:
             now = time.time()
             fps = 0.9 * fps + 0.1 / max(now - fps_t, 1e-3); fps_t = now
 
+            kp_now = results_to_543(res)
+            r = shoulder_ref(kp_now)
+            if r is not None:
+                ref = r if ref is None else (0.9 * ref[0] + 0.1 * r[0], 0.9 * ref[1] + 0.1 * r[1])
+
             if state == 'recording':
-                buf_kp.append(results_to_543(res)); buf_t.append(now - t0)
+                buf_kp.append(kp_now); buf_t.append(now - t0)
+                if queue[0] == 0:                                  # _idle: fixed length
+                    if now - t0 > IDLE_SECONDS:
+                        state = 'stop'
+                else:
+                    up = hand_raised(kp_now, ref)
+                    seen_up = seen_up or up
+                    n_up += int(up)
+                    if up:
+                        down_since = None
+                    elif seen_up:
+                        down_since = down_since or now
+                        if now - down_since > AUTO_STOP_S:         # signed, then hands down
+                            state = 'stop'
                 if now - t0 > MAX_SECONDS:
                     state = 'stop'
 
@@ -243,11 +307,16 @@ def record(data_dir: str, takes: int, camera: int) -> None:
             put(disp, f'take {done + 1}/{takes}   |   {len(queue)} left this session   |   {fps:.0f} fps', 85)
             hands = ('L ' if res.left_hand_landmarks else '. ') + ('R' if res.right_hand_landmarks else '.')
             put(disp, f'hands seen: {hands}', 120)
+            hint = framing_hint(frame, ref)
+            if hint and state == 'ready':
+                put(disp, hint, 200, (0, 140, 255))
+            put(disp, f'saving to: {os.path.basename(os.path.abspath(data_dir))}', disp.shape[0] - 60, (180, 180, 180), 0.6, 1)
             if state == 'ready':
-                put(disp, 'SPACE = start    R = redo last    S = skip    Q = quit', disp.shape[0] - 25)
+                put(disp, 'hands down, then SPACE = start    R = redo last    S = skip    Q = quit', disp.shape[0] - 25)
             elif state == 'recording':
                 cv2.circle(disp, (disp.shape[1] - 40, 40), 15, (0, 0, 255), -1)
-                put(disp, f'RECORDING {now - t0:.1f}s   SPACE = stop', disp.shape[0] - 25, (0, 0, 255))
+                msg = 'idle: sit naturally, do not sign' if queue[0] == 0 else 'sign now, then lower your hands'
+                put(disp, f'RECORDING {now - t0:.1f}s   {msg}', disp.shape[0] - 25, (0, 0, 255))
             if message and now < msg_until:
                 put(disp, message, 160, (0, 200, 255))
             cv2.imshow('Sign2Text recorder', disp)
@@ -258,6 +327,7 @@ def record(data_dir: str, takes: int, camera: int) -> None:
             if key == ord(' '):
                 if state == 'ready':
                     state, buf_kp, buf_t, t0 = 'recording', [], [], time.time()
+                    seen_up, down_since, n_up = False, None, 0
                 elif state == 'recording':
                     state = 'stop'
             elif key == ord('s') and state == 'ready':
@@ -272,16 +342,18 @@ def record(data_dir: str, takes: int, camera: int) -> None:
             if state == 'stop':
                 state = 'ready'
                 kp, t = np.stack(buf_kp) if buf_kp else np.zeros((0, NUM_KP, 3)), np.array(buf_t)
-                hp = hand_pct(kp)
                 if len(kp) < MIN_FRAMES:
                     message, msg_until = 'too short, not saved. Try again.', now + 3
                     continue
-                if cls != 0 and hp < MIN_HAND_PCT:
-                    message, msg_until = f'hands seen in only {hp:.0f}% of frames, not saved. Try again.', now + 3
+                if cls != 0 and not seen_up:
+                    message, msg_until = 'no raised hand seen, not saved. Try again.', now + 3
+                    continue
+                if cls != 0 and n_up < MIN_UP:
+                    message, msg_until = 'hands were up for too short, not saved. Try again.', now + 3
                     continue
                 path = save_take(data_dir, cls, kp, t, session)
                 counts[cls] += 1; queue.pop(0); last_saved = (path, cls)
-                message, msg_until = f'saved ({len(kp)} frames, hands {hp:.0f}%)', now + 2
+                message, msg_until = f'saved ({len(kp)} frames, {t[-1]:.1f}s)', now + 2
 
     cap.release()
     cv2.destroyAllWindows()
@@ -348,7 +420,23 @@ def selftest() -> None:
         q = build_queue(count_takes(d), takes=3, seed=0)
         assert q.count(1) == 2 and q.count(0) == 3 and len(q) == 3 * len(PHRASES) - 1
     print("  ✓")
-    print("\nAll tests PASSED ✓  You can now run:  python record_phrases.py")
+    print("── Test 5: raised-hand rule and framing hints")
+    k = np.zeros((543, 3), np.float32)
+    k[L_SH] = [0.42, 0.55, 0]; k[R_SH] = [0.58, 0.55, 0]
+    ref = shoulder_ref(k)
+    assert ref is not None and abs(ref[1] - 0.16 * ASPECT) < 1e-4
+    assert not hand_raised(k, ref)                                   # no hands
+    k[LH0:RH0] = [0.45, 0.60, 0]                                     # hand at chest
+    assert hand_raised(k, ref)
+    k[LH0:RH0] = [0.45, 0.99, 0]                                     # hand far below (lap)
+    assert not hand_raised(k, ref)
+    img = np.full((720, 1280, 3), 120, np.uint8)
+    assert framing_hint(img, None).startswith('shoulders')
+    assert framing_hint(img, (0.5, 0.6)).startswith('too close')
+    assert framing_hint(img, (0.5, 0.3)) == ''
+    assert framing_hint(img * 0 + 30, (0.5, 0.3)).startswith('too dark')
+    print("  ✓")
+    print("\nAll tests PASSED ✓  You can now run:  python demo/record_phrases.py")
 
 
 if __name__ == '__main__':
@@ -365,6 +453,3 @@ if __name__ == '__main__':
         show_stats(a.data, a.takes)
     else:
         record(a.data, a.takes, a.camera)
-        
-        
-        
