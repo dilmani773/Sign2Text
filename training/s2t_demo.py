@@ -241,22 +241,29 @@ def _load_dir(data_dir: str, names: dict) -> List[dict]:
                                  f"'{r['phrase']}' in {data_dir}. Both signers must use "
                                  f"the same PHRASES list.")
             names[cid] = r['phrase']
-            rows.append({'kp': kp, 'y': cid, 'session': f"{signer}/{r['session']}",
+            rows.append({'kp': kp, 'y': cid, 'phrase': r['phrase'],
+                         'session': f"{signer}/{r['session']}",
                          'signer': signer, 'file': r['file']})
     return rows
 
 
 def split_takes(takes: List[dict], val_frac: float = 0.2, seed: int = 0):
     """
-    Val = the latest session if there are 2+ sessions and it covers every
-    class (honest: a different day). Otherwise a random 20% per class.
+    Val = the latest session (a different day is the honest test), but only if
+    it covers every class, holds at most 40% of the takes, and leaves at least
+    2 training takes per class. Otherwise a random 20% per class.
     """
+    from collections import Counter
     sessions = sorted({t['session'] for t in takes}, key=lambda x: x.split('/')[-1])   # by time
+    all_classes = {t['y'] for t in takes}
     if len(sessions) >= 2:
         last = sessions[-1]
         val = [t for t in takes if t['session'] == last]
-        if {t['y'] for t in val} == {t['y'] for t in takes}:
-            return [t for t in takes if t['session'] != last], val, f'session {last}'
+        tr = [t for t in takes if t['session'] != last]
+        per_class = Counter(t['y'] for t in tr)
+        if ({t['y'] for t in val} == all_classes and len(val) <= 0.4 * len(takes)
+                and all(per_class[c] >= 2 for c in all_classes)):
+            return tr, val, f'session {last}'
     rng = np.random.default_rng(seed)
     tr, va = [], []
     for c in sorted({t['y'] for t in takes}):
@@ -317,11 +324,21 @@ def load_model(path: str):
     return m, ck
 
 
+def check_phrases(takes: List[dict], classes: List[str], where: str) -> None:
+    """Every test take's phrase must match the model's phrase for that class id."""
+    bad = sorted({(t['y'], t['phrase']) for t in takes
+                  if t['y'] >= len(classes) or classes[t['y']] != t['phrase']})
+    if bad:
+        cid, ph = bad[0]
+        expected = classes[cid] if cid < len(classes) else 'nothing'
+        raise SystemExit(f"Phrase list mismatch in {where}: class {cid} is '{ph}' there "
+                         f"but '{expected}' in the model. Use the same PHRASES list.")
+
+
 def eval_only(model_path: str, test_dirs) -> float:
     model, ck = load_model(model_path)
-    takes, classes = load_takes(test_dirs, verbose=True)
-    if classes[:len(ck['classes'])] != ck['classes'][:len(classes)]:
-        raise SystemExit("Phrase list of the test folder does not match the model.")
+    takes, _ = load_takes(test_dirs, verbose=True)
+    check_phrases(takes, ck['classes'], ', '.join(test_dirs))
     return report(model, takes, ck['classes'], f"Test accuracy on {', '.join(test_dirs)}")
 
 
@@ -392,9 +409,8 @@ def train(data_dir, out: str, pretrained: Optional[str], epochs: int = 80,
     test_acc = None
     if test_dirs:
         log("\nUnseen-signer test data:")
-        test_takes, test_classes = load_takes(test_dirs, verbose=verbose)
-        if test_classes[:n] != classes[:len(test_classes)]:
-            raise SystemExit("Phrase list of the test folder does not match the training data.")
+        test_takes, _ = load_takes(test_dirs, verbose=verbose)
+        check_phrases(test_takes, classes, ', '.join(test_dirs))
         test_acc = report(model, test_takes, classes, "Unseen-signer test", log)
     log(f"\nSaved {out}")
     return {'val_acc': acc, 'test_acc': test_acc, 'confusion': cm, 'classes': classes}
@@ -505,6 +521,22 @@ def selftest() -> None:
         except SystemExit:
             pass
         print(f"  ✓ (test acc {100 * res['test_acc']:.0f}%, eval-only {100 * acc:.0f}%)")
+
+    print("── Test 6: tiny first session does not swallow training; missing class is fine")
+    fake = lambda y, s: {'y': y, 'session': s, 'phrase': f'p{y}'}
+    takes = [fake(0, 'a/1')] + [fake(c, 'a/2') for c in range(3) for _ in range(3)]
+    tr, va, how = split_takes(takes)
+    assert how.startswith('random') and len(tr) >= 6, (how, len(tr))
+    takes = [fake(c, 'a/1') for c in range(3) for _ in range(4)] + [fake(c, 'a/2') for c in range(3)]
+    tr, va, how = split_takes(takes)
+    assert how.startswith('session') and len(va) == 3
+    check_phrases([fake(0, 'x'), fake(2, 'x')], ['p0', 'p1', 'p2'], 'test')   # class 1 missing: ok
+    try:
+        check_phrases([{'y': 1, 'phrase': 'other'}], ['p0', 'p1', 'p2'], 'test')
+        raise AssertionError('mismatch not caught')
+    except SystemExit:
+        pass
+    print("  ✓")
 
     print("\nAll tests PASSED ✓")
 
