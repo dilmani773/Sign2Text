@@ -33,7 +33,7 @@ def main(model_path: str, threshold: float, camera: int) -> None:
     import cv2
     import torch
     import mediapipe as mp
-    from s2t_demo import PhraseClassifier, Segmenter, clip_features, active_frames
+    from s2t_demo import PhraseClassifier, Segmenter, predict_proba
     from record_phrases import pad_to_16x9, results_to_543, put
 
     ck = torch.load(model_path, map_location='cpu', weights_only=False)
@@ -68,10 +68,7 @@ def main(model_path: str, threshold: float, camera: int) -> None:
 
             segment = seg.push(kp, now)
             if segment is not None:
-                feats = torch.from_numpy(clip_features(segment))[None]
-                mask = torch.ones(1, feats.shape[1], dtype=torch.bool)
-                with torch.no_grad():
-                    prob = torch.softmax(model(feats, mask), -1)[0]
+                prob = predict_proba(model, [segment])[0]          # works for either dominant hand
                 p, i = prob.max(0)
                 name = classes[int(i)]
                 if name == '_idle':

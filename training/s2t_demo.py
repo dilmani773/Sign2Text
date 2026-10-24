@@ -45,7 +45,8 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from s2t_phase1_dataset import select_stride, features_from_selected, ASPECT, FEATURE_DIM
+from s2t_phase1_dataset import (select_stride, features_from_selected, ASPECT, FEATURE_DIM,
+                                 POSE_KEEP, LIPS_OUTER, BROWS, LH_SL, RH_SL, FACE_SL)
 from s2t_phase34_model import PoseEncoder
 
 TARGET_FPS  = 20.0                 # How2Sign median fps
@@ -113,9 +114,43 @@ def trim_active(kp: np.ndarray, rng: Optional[np.random.Generator] = None) -> np
     return kp[a:b]
 
 
-def clip_features(kp: np.ndarray, rng: Optional[np.random.Generator] = None) -> np.ndarray:
+def _mirror_perm() -> np.ndarray:
+    """
+    Index map that mirrors the 85 selected points left ↔ right:
+    pose pairs swap, left hand ↔ right hand, lips and eyebrows swap sides.
+    """
+    pose_pairs = {11: 12, 13: 14, 15: 16, 17: 18, 19: 20, 21: 22}
+    pm = {**pose_pairs, **{v: k for k, v in pose_pairs.items()}}
+    pose = [POSE_KEEP.index(pm.get(i, i)) for i in POSE_KEEP]
+    lh = list(range(RH_SL.start, RH_SL.stop))          # new left hand  = old right hand
+    rh = list(range(LH_SL.start, LH_SL.stop))          # new right hand = old left hand
+    face_pairs = {61: 291, 185: 409, 40: 270, 39: 269, 37: 267, 0: 0, 146: 375, 91: 321,
+                  181: 405, 84: 314, 17: 17, 70: 300, 63: 293, 105: 334, 66: 296, 107: 336}
+    fm = {**face_pairs, **{v: k for k, v in face_pairs.items()}}
+    face_list = LIPS_OUTER + BROWS
+    face = [FACE_SL.start + face_list.index(fm[i]) for i in face_list]
+    return np.array(pose + lh + rh + face)
+
+
+MIRROR_PERM = _mirror_perm()
+
+
+def mirror_selected(x: np.ndarray, p: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Mirror a clip left ↔ right, as if a left-handed signer signed with the right
+    hand (or the other way). ASL lets each signer pick their dominant hand.
+    """
+    x = x[:, MIRROR_PERM].copy()
+    x[..., 0] *= -1.0
+    return x, p[:, MIRROR_PERM].copy()
+
+
+def clip_features(kp: np.ndarray, rng: Optional[np.random.Generator] = None,
+                  mirror: bool = False) -> np.ndarray:
     """Trimmed 20 fps clip (T, 543, 3) → features (T', 384)."""
     x, p = select_stride(kp.astype(np.float32), STRIDE)
+    if mirror:
+        x, p = mirror_selected(x, p)
     f = features_from_selected(x, p, max_frames=128, rng=rng)
     if f is None:                                        # no shoulders at all
         f = np.zeros((max(1, len(x)), FEATURE_DIM), np.float32)
@@ -274,8 +309,15 @@ def split_takes(takes: List[dict], val_frac: float = 0.2, seed: int = 0):
     return tr, va, f'random {int(val_frac * 100)}% per class'
 
 
-def make_batch(takes: List[dict], rng: Optional[np.random.Generator]):
-    feats = [torch.from_numpy(clip_features(trim_active(t['kp'], rng), rng)) for t in takes]
+def make_batch(takes: List[dict], rng: Optional[np.random.Generator], mirror: Optional[bool] = None):
+    """
+    mirror=None: random mirror for half the takes when training (rng given), none otherwise.
+    mirror=True/False: mirror all / none (used for two-way prediction).
+    """
+    feats = []
+    for t in takes:
+        m = (rng.random() < 0.5) if (mirror is None and rng is not None) else bool(mirror)
+        feats.append(torch.from_numpy(clip_features(trim_active(t['kp'], rng), rng, mirror=m)))
     T = max(f.shape[0] for f in feats)
     x = torch.zeros(len(feats), T, FEATURE_DIM)
     m = torch.zeros(len(feats), T, dtype=torch.bool)
@@ -289,13 +331,36 @@ def make_batch(takes: List[dict], rng: Optional[np.random.Generator]):
 # SECTION 4 — TRAINING
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _pad(feats: List[np.ndarray]):
+    T = max(len(f) for f in feats)
+    x = torch.zeros(len(feats), T, FEATURE_DIM)
+    m = torch.zeros(len(feats), T, dtype=torch.bool)
+    for i, f in enumerate(feats):
+        x[i, :len(f)] = torch.from_numpy(f); m[i, :len(f)] = True
+    return x, m
+
+
+@torch.no_grad()
+def predict_proba(model, segments: List[np.ndarray]) -> torch.Tensor:
+    """
+    Class probabilities for trimmed clips (T, 543, 3). Averages the clip and its
+    mirror image, so left- and right-handed signing are treated the same.
+    """
+    model.eval()
+    probs = 0
+    for mirror in (False, True):
+        x, m = _pad([clip_features(s, None, mirror=mirror) for s in segments])
+        probs = probs + torch.softmax(model(x, m), -1)
+    return probs / 2
+
+
 @torch.no_grad()
 def evaluate(model, takes, n_classes, batch=32):
     model.eval()
     preds = []
     for i in range(0, len(takes), batch):
-        x, m, _ = make_batch(takes[i:i + batch], None)
-        preds += model(x, m).argmax(-1).tolist()
+        segs = [trim_active(t['kp']) for t in takes[i:i + batch]]
+        preds += predict_proba(model, segs).argmax(-1).tolist()
     y = [t['y'] for t in takes]
     cm = np.zeros((n_classes, n_classes), dtype=int)
     for a, b in zip(y, preds):
@@ -537,6 +602,23 @@ def selftest() -> None:
     except SystemExit:
         pass
     print("  ✓")
+
+    print("── Test 7: mirroring")
+    assert sorted(MIRROR_PERM.tolist()) == list(range(85))
+    assert (MIRROR_PERM[MIRROR_PERM] == np.arange(85)).all()          # mirror twice = identity
+    kp, t = _fake_take(rng, 2)
+    kp[:, RH_WRIST:RH_WRIST + 21] = 0                                  # one-handed sign
+    x, p = select_stride(resample_fps(kp, t), STRIDE)
+    xm, pm = mirror_selected(x, p)
+    assert pm[:, RH_SL].any() and not pm[:, LH_SL].any()               # hand moved to the other slot
+    x2, p2 = mirror_selected(xm, pm)
+    assert np.allclose(x2, x) and (p2 == p).all()
+    f1 = features_from_selected(x, p, 128); f2 = features_from_selected(xm, pm, 128)
+    assert f1.shape == f2.shape and not np.allclose(f1, f2)
+    m3 = PhraseClassifier(3, dict(d=32, layers=2, heads=4, ff=64, dropout=0.1))
+    pr = predict_proba(m3, [resample_fps(kp, t)])
+    assert pr.shape == (1, 3) and abs(float(pr.sum()) - 1) < 1e-4
+    print("  ✓ mirror map is a clean left/right swap, two-way prediction works")
 
     print("\nAll tests PASSED ✓")
 
