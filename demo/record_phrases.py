@@ -49,6 +49,7 @@ import sys
 import time
 import random
 import argparse
+from typing import Optional
 from datetime import datetime
 
 import numpy as np
@@ -183,10 +184,12 @@ def count_takes(data_dir: str) -> dict:
     return counts
 
 
-def build_queue(counts: dict, takes: int, seed=None) -> list:
-    """Round-robin in shuffled order, so each phrase is spread across the session."""
+def build_queue(counts: dict, takes: int, seed=None, only=None) -> list:
+    """Round-robin in shuffled order, so each phrase is spread across the session.
+    only: optional set of class ids to record (others are skipped)."""
     rng = random.Random(seed)
-    queue, need = [], {i: max(0, takes - c) for i, c in counts.items()}
+    queue, need = [], {i: max(0, takes - c) for i, c in counts.items()
+                       if only is None or i in only}
     while any(need.values()):
         rnd = [i for i, n in need.items() if n > 0]
         rng.shuffle(rnd)
@@ -235,7 +238,23 @@ def put(img, text, y, color=(255, 255, 255), scale=0.8, thick=2):
     cv2.putText(img, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
 
 
-def record(data_dir: str, takes: int, camera: int) -> None:
+def parse_only(names) -> Optional[set]:
+    """--only "_idle" "hello"  ->  {0, 1}. Accepts phrase names or class numbers."""
+    if not names:
+        return None
+    ids = set()
+    lower = [p.lower() for p in PHRASES]
+    for n in names:
+        if n.isdigit() and int(n) < len(PHRASES):
+            ids.add(int(n))
+        elif n.lower() in lower:
+            ids.add(lower.index(n.lower()))
+        else:
+            sys.exit(f'Unknown phrase "{n}". Use one of: {", ".join(PHRASES)}')
+    return ids
+
+
+def record(data_dir: str, takes: int, camera: int, only=None) -> None:
     import cv2
     import mediapipe as mp
 
@@ -247,7 +266,7 @@ def record(data_dir: str, takes: int, camera: int) -> None:
         sys.exit(f"Could not open camera {camera}. Try --camera 1")
 
     counts  = count_takes(data_dir)
-    queue   = build_queue(counts, takes)
+    queue   = build_queue(counts, takes, only=only)
     session = datetime.now().strftime('%Y%m%d_%H%M')
     if not queue:
         print(f"All phrases already have {takes} takes. Use --takes with a higher number.")
@@ -311,11 +330,14 @@ def record(data_dir: str, takes: int, camera: int) -> None:
             if hint and state == 'ready':
                 put(disp, hint, 200, (0, 140, 255))
             put(disp, f'saving to: {os.path.basename(os.path.abspath(data_dir))}', disp.shape[0] - 60, (180, 180, 180), 0.6, 1)
+            if state == 'ready' and queue[0] == 0:
+                put(disp, 'idle: raise your hands but do NOT sign: touch face, fix glasses or hair,', 240, (255, 200, 0), 0.6, 1)
+                put(disp, 'scratch, rest hands on chest, cross arms, hold a phone. Vary it every take.', 268, (255, 200, 0), 0.6, 1)
             if state == 'ready':
                 put(disp, 'hands down, then SPACE = start    R = redo last    S = skip    Q = quit', disp.shape[0] - 25)
             elif state == 'recording':
                 cv2.circle(disp, (disp.shape[1] - 40, 40), 15, (0, 0, 255), -1)
-                msg = 'idle: sit naturally, do not sign' if queue[0] == 0 else 'sign now, then lower your hands'
+                msg = 'idle: move your hands but do NOT sign' if queue[0] == 0 else 'sign now, then lower your hands'
                 put(disp, f'RECORDING {now - t0:.1f}s   {msg}', disp.shape[0] - 25, (0, 0, 255))
             if message and now < msg_until:
                 put(disp, message, 160, (0, 200, 255))
@@ -436,6 +458,11 @@ def selftest() -> None:
     assert framing_hint(img, (0.5, 0.3)) == ''
     assert framing_hint(img * 0 + 30, (0.5, 0.3)).startswith('too dark')
     print("  ✓")
+    print("── Test 6: --only")
+    assert parse_only(['_idle']) == {0} and parse_only(['Hello', '18']) == {1, 18}
+    q = build_queue({i: 0 for i in range(len(PHRASES))}, takes=5, only={0})
+    assert q == [0] * 5
+    print("  ✓")
     print("\nAll tests PASSED ✓  You can now run:  python demo/record_phrases.py")
 
 
@@ -446,10 +473,12 @@ if __name__ == '__main__':
     ap.add_argument('--camera', type=int, default=0)
     ap.add_argument('--stats', action='store_true')
     ap.add_argument('--selftest', action='store_true')
+    ap.add_argument('--only', nargs='+', default=None,
+                    help='record only these phrases, e.g. --only _idle  or  --only "how are you" bad')
     a = ap.parse_args()
     if a.selftest:
         selftest()
     elif a.stats:
         show_stats(a.data, a.takes)
     else:
-        record(a.data, a.takes, a.camera)
+        record(a.data, a.takes, a.camera, parse_only(a.only))
