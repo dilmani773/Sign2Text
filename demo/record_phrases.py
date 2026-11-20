@@ -76,6 +76,7 @@ PHRASES = [
     "bad",
     "i love you",
     "do you understand?",
+    "my name is",               # added later: always append new phrases at the END
 ]
 
 N_POSE, N_FACE, N_HAND = 33, 468, 21

@@ -17,6 +17,11 @@ Presentation mode for demo videos (clean subtitles, no technical text):
     python demo/live_demo.py --present --record videos/demo.mp4 --fullscreen
     Keys in presentation mode:  K = skeleton on/off   C = clear   Q = quit
 
+Fingerspelling names (needs results/letters_model.pt from demo/fingerspell.py):
+    sign "my name is", lower your hands, then spell the name letter by letter
+    (hold each letter still), lower your hands → "My name is Hiyumi".
+    F = start spelling at any time.
+
 Debug (shows the top 3 guesses, saves every segment for later checking):
     python demo/live_demo.py --debug --save live_segments
 
@@ -37,9 +42,13 @@ sys.path.insert(0, os.path.join(ROOT, 'training'))
 sys.path.insert(0, os.path.join(ROOT, 'demo'))
 
 
+SPELL_TRIGGER = 'my name is'
+SPELL_TIMEOUT = 8.0          # leave spelling mode if nothing is spelled for this long
+
+
 def main(model_path: str, threshold: float, camera: int, debug: bool = False,
          save_dir: str = None, present: bool = False, record_path: str = None,
-         fullscreen: bool = False) -> None:
+         fullscreen: bool = False, letters_path: str = None) -> None:
     import cv2
     import torch
     import mediapipe as mp
@@ -69,6 +78,34 @@ def main(model_path: str, threshold: float, camera: int, debug: bool = False,
         cv2.namedWindow(win, cv2.WND_PROP_FULLSCREEN)
         cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
+    speller, spelling, spell_prefix, spell_t = None, False, '', 0.0
+    if letters_path and os.path.exists(letters_path):
+        from fingerspell import LetterModel, Speller
+        speller = Speller(LetterModel.load(letters_path))
+        print(f"Fingerspelling on: {letters_path}")
+    else:
+        print("Fingerspelling off (no letters model found).")
+
+    def start_spelling(prefix: str, now: float):
+        nonlocal spelling, spell_prefix, spell_t
+        speller.reset()
+        spelling, spell_prefix, spell_t = True, prefix, now
+        if presenter:
+            presenter.show_live(f'{prefix} ...'.strip(), now)
+
+    def stop_spelling(now: float, word: str):
+        nonlocal spelling, seg, history, last, last_until
+        spelling = False
+        seg = Segmenter()
+        if word:
+            text = f'{spell_prefix} {word.capitalize()}'.strip()
+            history = (history + [text])[-6:]
+            last, last_until = (text, 1.0), now + 3.0
+            if presenter:
+                presenter.finish_live(text, now)
+        elif presenter:
+            presenter.cancel_live()
+
     seg = Segmenter()
     history, last, last_until, top3 = [], None, 0.0, []
     if save_dir:
@@ -88,22 +125,35 @@ def main(model_path: str, threshold: float, camera: int, debug: bool = False,
             fps = 0.9 * fps + 0.1 / max(now - fps_t, 1e-3); fps_t = now
             kp = results_to_543(res)
 
-            segment = seg.push(kp, now)
+            if spelling:
+                ev = speller.push(kp)
+                if presenter and speller.spelled:
+                    presenter.show_live(f'{spell_prefix} {speller.spelled}'.strip(), now)
+                if ev == 'END':
+                    stop_spelling(now, speller.spelled)
+                elif not speller.spelled and now - spell_t > SPELL_TIMEOUT:
+                    stop_spelling(now, '')
+                segment = None
+            else:
+                segment = seg.push(kp, now)
             if segment is not None:
                 prob = predict_proba(model, [segment])[0]          # works for either dominant hand
                 p, i = prob.max(0)
                 name = classes[int(i)]
-                vals, idx = prob.topk(3)
+                vals, idx = prob.topk(min(3, len(classes)))
                 top3 = [(classes[int(j)], float(v)) for v, j in zip(vals, idx)]
                 if debug:
                     print(f"{len(segment):3d} frames  " +
                           "  |  ".join(f"{c} {100 * v:.0f}%" for c, v in top3))
                 if save_dir:
-                    fn = time.strftime('%Y%m%d_%H%M%S') + f'_{name.replace(" ", "_").replace("?", "")}.npz'
+                    n_saved = len(os.listdir(save_dir))
+                    fn = time.strftime('%Y%m%d_%H%M%S') + f'_{n_saved:04d}_{name.replace(" ", "_").replace("?", "")}.npz'
                     np.savez_compressed(os.path.join(save_dir, fn), kp=segment.astype(np.float32),
                                         top3=np.array([c for c, _ in top3]))
                 if name == '_idle':
                     last = None
+                elif p.item() >= threshold and name == SPELL_TRIGGER and speller:
+                    start_spelling('My name is', now)          # next: spell the name
                 elif p.item() >= threshold:
                     last = (name, p.item())
                     history = (history + [name])[-6:]
@@ -123,7 +173,7 @@ def main(model_path: str, threshold: float, camera: int, debug: bool = False,
                 ph, pw = disp.shape[:2]                        # remove 16:9 padding bars
                 x0, y0 = (pw - raw_w) // 2, (ph - raw_h) // 2
                 disp = cv2.flip(disp[y0:y0 + raw_h, x0:x0 + raw_w], 1)
-                disp = presenter.render(disp, now, signing=bool(seg.seg))
+                disp = presenter.render(disp, now, signing=bool(seg.seg) or spelling)
                 if record_path:
                     if recorder is None:
                         recorder = VideoRecorder(record_path, (disp.shape[1], disp.shape[0]))
@@ -136,6 +186,8 @@ def main(model_path: str, threshold: float, camera: int, debug: bool = False,
                     presenter.clear(); history, last = [], None
                 if key == ord('k'):
                     presenter.show_skeleton = not presenter.show_skeleton
+                if key == ord('f') and speller and not spelling:
+                    start_spelling('', now)
                 continue
 
             disp = frame.copy()
@@ -145,6 +197,8 @@ def main(model_path: str, threshold: float, camera: int, debug: bool = False,
             disp = cv2.flip(disp, 1)
 
             signing = bool(seg.seg)
+            if spelling:
+                put(disp, f'SPELLING: {spell_prefix} {speller.spelled}'.strip(), 160, (255, 200, 0), 1.2, 3)
             put(disp, 'signing...' if signing else 'ready: raise your hands to sign', 45,
                 (0, 0, 255) if signing else (200, 200, 200), 0.9)
             if last and now < last_until:
@@ -163,6 +217,8 @@ def main(model_path: str, threshold: float, camera: int, debug: bool = False,
                 break
             if key == ord('c'):
                 history, last = [], None
+            if key == ord('f') and speller and not spelling:
+                start_spelling('', now)
 
     if recorder:
         recorder.close()
@@ -181,5 +237,7 @@ if __name__ == '__main__':
     ap.add_argument('--present', action='store_true', help='clean presentation look for demo videos')
     ap.add_argument('--record', default=None, metavar='FILE.mp4', help='save the presentation view as a video')
     ap.add_argument('--fullscreen', action='store_true')
+    ap.add_argument('--letters', default=os.path.join(ROOT, 'results', 'letters_model.pt'),
+                    help='fingerspelling model from demo/fingerspell.py')
     a = ap.parse_args()
-    main(a.model, a.threshold, a.camera, a.debug, a.save, a.present, a.record, a.fullscreen)
+    main(a.model, a.threshold, a.camera, a.debug, a.save, a.present, a.record, a.fullscreen, a.letters)
