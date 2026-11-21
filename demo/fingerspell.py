@@ -59,7 +59,7 @@ FEAT_DIM = 63 + 15 + 3                  # mean hand shape + fingertip motion + w
 HOLD_S, MOTION_HOLD_S = 2.0, 3.0        # recording length per take
 SKIP_S = 0.3                            # ignore the first frames of a take (hand settling)
 
-STABLE = 6                              # live: same letter this many windows in a row
+STABLE = 5                              # live: same letter this many windows in a row
 MIN_PROB = 0.6                          # live: minimum confidence to accept a letter
 END_FRAMES = 10                         # live: frames without a raised hand that end the name
 
@@ -157,6 +157,63 @@ def augment(f: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     return f
 
 
+def finger_spread(f: np.ndarray) -> float:
+    """Gap between index and middle fingertips (U: together, V: apart), hand-size units."""
+    return float(np.linalg.norm(f[3 * 8:3 * 8 + 2] - f[3 * 12:3 * 12 + 2]))
+
+
+def tip_move(f: np.ndarray, tip_point: int) -> float:
+    """How far one fingertip moved inside the window (J: pinky, Z: index)."""
+    k = 63 + 3 * TIPS.index(tip_point)
+    return float(np.linalg.norm(f[k:k + 2]))
+
+
+MOTION_TIP = {'J': 20, 'Z': 8}
+
+
+def best_split(a: np.ndarray, b: np.ndarray) -> float:
+    """Threshold that best separates values a (below) from b (above)."""
+    cand = np.unique(np.concatenate([a, b]))
+    accs = [((a < c).mean() + (b >= c).mean()) / 2 for c in cand]
+    return float(cand[int(np.argmax(accs))])
+
+
+def learn_rules(feats: np.ndarray, ys: np.ndarray) -> dict:
+    """
+    Two simple checks on top of the model, learned from the recordings:
+      U vs V: decided by the index/middle fingertip gap.
+      J, Z:   only accepted when that fingertip really moves (else I, D, ...).
+    """
+    rules = {}
+    U, V = LETTERS.index('U'), LETTERS.index('V')
+    su = np.array([finger_spread(f) for f in feats[ys == U]])
+    sv = np.array([finger_spread(f) for f in feats[ys == V]])
+    if len(su) and len(sv):
+        rules['uv_split'] = best_split(su, sv)
+        rules['uv_medians'] = (float(np.median(su)), float(np.median(sv)))
+    static = np.array([LETTERS[y] not in MOTION_LETTERS for y in ys])
+    for L, tip in MOTION_TIP.items():
+        if static.any():
+            still = np.array([tip_move(f, tip) for f in feats[static]])
+            rules[f'move_{L}'] = float(np.percentile(still, 90))      # normal shake of a held letter
+    return rules
+
+
+def apply_rules(rules: dict, f: np.ndarray, p: np.ndarray) -> Tuple[str, float]:
+    p = p.copy()
+    if rules:
+        for L, tip in MOTION_TIP.items():
+            k = f'move_{L}'
+            if k in rules and tip_move(f, tip) < rules[k]:
+                p[LETTERS.index(L)] = 0.0                  # no real movement → not J / Z
+        p = p / max(float(p.sum()), 1e-9)
+    i = int(p.argmax()); letter, prob = LETTERS[i], float(p[i])
+    if rules and 'uv_split' in rules and letter in ('U', 'V'):
+        prob = float(p[LETTERS.index('U')] + p[LETTERS.index('V')])
+        letter = 'U' if finger_spread(f) < rules['uv_split'] else 'V'
+    return letter, prob
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 2 — DATA FILES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -172,6 +229,23 @@ def save_letter_take(data_dir: str, letter: str, kp: np.ndarray, t: np.ndarray) 
     path = os.path.join(folder, datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '.npz')
     np.savez_compressed(path, kp=kp.astype(np.float32), t=t.astype(np.float32))
     return path
+
+
+def take_frame_gap(data_dirs: List[str]) -> Optional[float]:
+    """Typical seconds between frames in the recorded takes."""
+    gaps = []
+    for d in data_dirs:
+        for L in LETTERS:
+            folder = os.path.join(d, L)
+            if not os.path.isdir(folder):
+                continue
+            for fn in os.listdir(folder):
+                if fn.endswith('.npz'):
+                    with np.load(os.path.join(folder, fn)) as z:
+                        t = z['t']
+                    if len(t) > 2:
+                        gaps.append(float(np.median(np.diff(t))))
+    return float(np.median(gaps)) if gaps else None
 
 
 def load_letter_windows(data_dirs: List[str], verbose: bool = True):
@@ -212,8 +286,11 @@ def make_model(n_classes: int = 26):
 class LetterModel:
     """Wraps the classifier with its input normalisation."""
 
-    def __init__(self, net, mean: np.ndarray, std: np.ndarray):
+    def __init__(self, net, mean: np.ndarray, std: np.ndarray, dt: Optional[float] = None,
+                 rules: Optional[dict] = None):
         self.net, self.mean, self.std = net, mean, std
+        self.rules = rules or {}
+        self.dt = dt                     # seconds between frames in the training takes
         self.net.eval()
 
     def proba(self, feats: np.ndarray) -> np.ndarray:
@@ -226,7 +303,7 @@ class LetterModel:
         import torch
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         torch.save({'model': self.net.state_dict(), 'mean': self.mean, 'std': self.std,
-                    'letters': LETTERS, **info}, path)
+                    'letters': LETTERS, 'dt': self.dt, 'rules': self.rules, **info}, path)
 
     @staticmethod
     def load(path: str) -> 'LetterModel':
@@ -234,7 +311,7 @@ class LetterModel:
         ck = torch.load(path, map_location='cpu', weights_only=False)
         net = make_model(len(ck['letters']))
         net.load_state_dict(ck['model'])
-        return LetterModel(net, ck['mean'], ck['std'])
+        return LetterModel(net, ck['mean'], ck['std'], ck.get('dt'), ck.get('rules'))
 
 
 def train_letters(data_dirs: List[str], out: str, test_dirs: Optional[List[str]] = None,
@@ -296,7 +373,19 @@ def train_letters(data_dirs: List[str], out: str, test_dirs: Optional[List[str]]
             log(f"epoch {ep:3d} | loss {loss.item():.3f} | val acc {100 * acc:5.1f}%")
 
     net.load_state_dict(best_state)
-    model = LetterModel(net, mean, std)
+    dt = take_frame_gap(data_dirs)
+    rules = learn_rules(X, Y)
+    model = LetterModel(net, mean, std, dt, rules)
+    if 'uv_split' in rules:
+        mu, mv = rules['uv_medians']
+        log(f"U/V check: fingertip gap U {mu:.2f}, V {mv:.2f} → split at {rules['uv_split']:.2f}")
+    if va:
+        Pv = model.proba(np.stack([f for f, _ in va]))
+        plain = np.mean([LETTERS[int(p.argmax())] == LETTERS[y] for p, (_, y) in zip(Pv, va)])
+        ruled = np.mean([apply_rules(rules, f, p)[0] == LETTERS[y] for p, (f, y) in zip(Pv, va)])
+        log(f"Val accuracy: model {100 * plain:.1f}% | model + U/V and J/Z checks {100 * ruled:.1f}%")
+    if dt:
+        log(f"Recorded takes: {1 / dt:.1f} frames per second (live spelling will match this)")
     acc, cm = acc_on(va, model)
     log(f"\nBest val accuracy (per window): {100 * best:.1f}%")
     if cm is not None:
@@ -333,12 +422,29 @@ class Speller:
 
     def reset(self) -> None:
         self.buf: List[np.ndarray] = []
+        self.tbuf: List[Tuple[float, np.ndarray]] = []
         self.run_letter, self.run_len = None, 0
         self.last_letter, self.broken = None, True
         self.no_hand, self.spelled, self.ended = 0, '', False
         self.current = None                  # (letter, prob) of the latest window
 
-    def push(self, kp: np.ndarray) -> Optional[str]:
+    def _timed_window(self, kp: np.ndarray, t: float) -> Optional[List[np.ndarray]]:
+        """
+        WINDOW frames spaced like the training takes, whatever the live frame
+        rate is. Without this, a slower or faster live loop changes the
+        fingertip motion the model sees (and U can turn into V).
+        """
+        dt = self.model.dt
+        span = dt * (WINDOW - 1)
+        self.tbuf = [(tt, f) for tt, f in self.tbuf if t - tt <= span + 2 * dt] + [(t, kp)]
+        if t - self.tbuf[0][0] < 0.8 * span:
+            return None
+        times = np.array([tt for tt, _ in self.tbuf])
+        picks = [int(np.argmin(np.abs(times - (t - k * dt)))) for k in range(WINDOW - 1, -1, -1)]
+        return [self.tbuf[i][1] for i in picks]
+
+    def push(self, kp: np.ndarray, t: Optional[float] = None) -> Optional[str]:
+        """kp: one frame (543, 3). t: its time in seconds (live), or None."""
         if signing_hand(kp) is None:
             self.no_hand += 1
             self.run_letter, self.run_len, self.broken = None, 0, True
@@ -347,15 +453,21 @@ class Speller:
                 return 'END'
             return None
         self.no_hand = 0
-        self.buf = (self.buf + [kp])[-WINDOW:]
-        if len(self.buf) < WINDOW:
-            return None
-        f = window_features(self.buf)
+        if t is not None and self.model.dt:
+            frames = self._timed_window(kp, t)
+            if frames is None:
+                return None
+        else:
+            self.buf = (self.buf + [kp])[-WINDOW:]
+            if len(self.buf) < WINDOW:
+                return None
+            frames = self.buf
+        f = window_features(frames)
         if f is None:
             return None
         p = self.model.proba(f[None])[0]
-        i = int(p.argmax()); letter, prob = LETTERS[i], float(p[i])
-        self.current = (letter, prob)
+        letter, prob = apply_rules(self.model.rules, f, p)
+        self.current = (letter, prob, finger_spread(f))
         if prob < self.min_prob:
             self.run_letter, self.run_len, self.broken = None, 0, True
             return None
@@ -477,7 +589,7 @@ def live_letters(model_path: str, camera: int, min_prob: float = MIN_PROB) -> No
                 break
             frame = pad_to_16x9(frame)
             res = hol.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            ev = speller.push(results_to_543(res))
+            ev = speller.push(results_to_543(res), time.time())
             if ev == 'END':
                 words = (words + [speller.spelled])[-5:]; speller.reset()
             disp = frame.copy()
@@ -486,7 +598,7 @@ def live_letters(model_path: str, camera: int, min_prob: float = MIN_PROB) -> No
             disp = cv2.flip(disp, 1)
             put(disp, f'Spelling: {speller.spelled}', 60, (0, 255, 255), 1.4, 3)
             if speller.current:
-                put(disp, f'now: {speller.current[0]} {100 * speller.current[1]:.0f}%', 110, (200, 255, 200), 0.8)
+                put(disp, f'now: {speller.current[0]} {100 * speller.current[1]:.0f}%  gap {speller.current[2]:.2f}', 110, (200, 255, 200), 0.8)
             if words:
                 put(disp, 'Words: ' + ' | '.join(words), disp.shape[0] - 60, (255, 255, 255), 0.8)
             put(disp, 'hold each letter still, lower hands to finish   C = clear   Q = quit', disp.shape[0] - 25, (180, 180, 180), 0.6)
@@ -569,6 +681,19 @@ def selftest() -> None:
         assert ''.join(events[:-1]) == 'HIYUMI' and events[-1] == 'END', events
         print(f"  ✓ {''.join(events[:-1])} then END")
 
+        print("── Test 4b: live window matches the training frame spacing at any live speed")
+        assert model.dt is not None and abs(model.dt - 1 / 16) < 1e-6, model.dt
+        for live_fps in (8, 16, 30):
+            sp = Speller(model)
+            for i in range(41):
+                t = i / live_fps
+                fr = _fake_letter_frame(LETTERS.index('U'), rng, jitter=0)
+                fr[RH0:RH0 + 21, 0] += 0.05 * t                 # hand drifts right at a fixed speed
+                w = sp._timed_window(fr, t)
+            covered = (w[-1][RH0, 0] - w[0][RH0, 0]) / 0.05      # seconds the window spans
+            assert abs(covered - (WINDOW - 1) / 16) <= 0.51 / live_fps + 1e-4, (live_fps, covered)
+        print("  ✓ window covers the same time at 8, 16 and 30 fps")
+
         print("── Test 5: double letter needs a break (II only with a bounce)")
         sp.reset(); ev = []
         for i in range(30):
@@ -582,6 +707,24 @@ def selftest() -> None:
             if e: ev.append(e)
         assert ev == ['I', 'I'], ev
         print("  ✓")
+
+    print("── Test 6: U/V gap check and J/Z need real movement")
+    feats, ys = [], []
+    for L, gap, move in (('U', 0.05, 0), ('V', 0.40, 0), ('I', 0, 0.02), ('J', 0, 0.5)):
+        for _ in range(30):
+            f = rng.normal(0, 0.01, FEAT_DIM).astype(np.float32)
+            f[3 * 12:3 * 12 + 2] = f[3 * 8:3 * 8 + 2] + [gap + rng.normal(0, 0.03), 0]
+            k = 63 + 3 * TIPS.index(20); f[k] = move + abs(rng.normal(0, 0.01))
+            feats.append(f); ys.append(LETTERS.index(L))
+    rules = learn_rules(np.stack(feats), np.array(ys))
+    assert 0.05 < rules['uv_split'] < 0.40, rules
+    pv = np.zeros(26, np.float32); pv[LETTERS.index('V')] = 0.7; pv[LETTERS.index('U')] = 0.3
+    assert apply_rules(rules, feats[0], pv)[0] == 'U'            # tips together → U, even if model says V
+    assert apply_rules(rules, feats[30], pv)[0] == 'V'
+    pj = np.zeros(26, np.float32); pj[LETTERS.index('J')] = 0.7; pj[LETTERS.index('I')] = 0.3
+    assert apply_rules(rules, feats[60], pj)[0] == 'I'           # held still → I, not J
+    assert apply_rules(rules, feats[90], pj)[0] == 'J'           # pinky moved → J
+    print("  ✓")
 
     print("\nAll tests PASSED ✓")
 

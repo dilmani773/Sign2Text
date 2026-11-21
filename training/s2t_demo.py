@@ -57,7 +57,9 @@ RAISE_LIMIT = 1.3                  # hand counts as "up" if wrist is less than t
                                    # shoulder widths below the shoulder line
 PAD_FRAMES  = 3                    # frames kept before / after the active part
 MIN_SEG     = 6                    # shortest segment (frames at 20 fps)
-END_GAP     = 8                    # live: inactive frames that end a segment (0.4 s)
+END_GAP     = 8                    # live: inactive frames that always end a segment
+END_S       = 0.6                  # live: or this many seconds with hands down (min 2 frames);
+                                   # same as the recorder's auto-stop, so multi-sign phrases stay whole
 
 DEFAULT_ENCODER = dict(d=384, layers=6, heads=6, ff=1536, dropout=0.15)
 
@@ -170,6 +172,7 @@ class Segmenter:
         self.seg_t: List[float] = []
         self.pre: List[Tuple[np.ndarray, float]] = []
         self.inactive = 0
+        self.last_active_t = 0.0
         self.ref_frames = ref_frames
 
     def push(self, kp: np.ndarray, t: float) -> Optional[np.ndarray]:
@@ -182,12 +185,17 @@ class Segmenter:
             if act:
                 self.seg = [f for f, _ in self.pre]
                 self.seg_t = [s for _, s in self.pre]
-                self.inactive = 0
+                self.inactive, self.last_active_t = 0, t
             return None
 
         self.seg.append(kp); self.seg_t.append(t)
-        self.inactive = 0 if act else self.inactive + 1
-        if self.inactive >= END_GAP or self.seg_t[-1] - self.seg_t[0] > 8.0:
+        if act:
+            self.inactive, self.last_active_t = 0, t
+        else:
+            self.inactive += 1
+        ended = (self.inactive >= END_GAP
+                 or (self.inactive >= 2 and t - self.last_active_t >= END_S))
+        if ended or self.seg_t[-1] - self.seg_t[0] > 8.0:
             seg = resample_fps(np.stack(self.seg), np.array(self.seg_t))
             self.seg, self.seg_t, self.pre, self.inactive = [], [], [], 0
             seg = trim_active(seg)
@@ -347,11 +355,12 @@ def predict_proba(model, segments: List[np.ndarray]) -> torch.Tensor:
     mirror image, so left- and right-handed signing are treated the same.
     """
     model.eval()
-    probs = 0
-    for mirror in (False, True):
-        x, m = _pad([clip_features(s, None, mirror=mirror) for s in segments])
-        probs = probs + torch.softmax(model(x, m), -1)
-    return probs / 2
+    n = len(segments)
+    feats = ([clip_features(s, None, mirror=False) for s in segments] +
+             [clip_features(s, None, mirror=True) for s in segments])
+    x, m = _pad(feats)                                   # one forward pass for both views
+    probs = torch.softmax(model(x, m), -1)
+    return (probs[:n] + probs[n:]) / 2
 
 
 @torch.no_grad()

@@ -126,7 +126,7 @@ def main(model_path: str, threshold: float, camera: int, debug: bool = False,
             kp = results_to_543(res)
 
             if spelling:
-                ev = speller.push(kp)
+                ev = speller.push(kp, now)
                 if presenter and speller.spelled:
                     presenter.show_live(f'{spell_prefix} {speller.spelled}'.strip(), now)
                 if ev == 'END':

@@ -74,6 +74,8 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 python training/s2t_demo.py --data data --test data_friend     # train on signer 1, test on unseen signer 2
 python training/s2t_demo.py --data data data_friend            # train on both
 python demo/live_demo.py
+python demo/present_demo.py    # fast presentation window (use --fast on slow laptops)
+python demo/web_demo.py        # browser UI: captions, conversation, fingerspelling
 ```
 
 ## Author

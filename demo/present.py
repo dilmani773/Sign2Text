@@ -63,6 +63,7 @@ class Presenter:
         self.current: Optional[Tuple[str, float]] = None      # (text, time shown)
         self.transcript: List[str] = []
         self.show_skeleton = True
+        self.show_transcript = True          # small line of earlier phrases above the caption
         self.live_text: Optional[str] = None                   # text being spelled right now
         self._fonts = {}
 
@@ -130,10 +131,10 @@ class Presenter:
         if live:
             a = 1.0
         band_h = int(150 * s)
-        if a > 0 or self.transcript:
+        if a > 0 or (self.show_transcript and self.transcript):
             d.rectangle((0, h - band_h, w, h), fill=(10, 10, 15, int(150 * max(a, 0.55))))
         cur_in_list = a > 0 and not live          # the newest phrase is shown big, not in the list
-        if len(self.transcript) > (1 if cur_in_list else 0):
+        if self.show_transcript and len(self.transcript) > (1 if cur_in_list else 0):
             past = self.transcript[:-1] if cur_in_list else self.transcript
             line = '   ·   '.join(past)
             fs = self.font('regular', int(22 * s))

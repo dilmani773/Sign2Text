@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign2Text</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #0E2A2D;        /* page */
+    --deep: #0A2124;       /* video well */
+    --panel: #16393D;      /* side panel */
+    --line: #24504F;       /* quiet borders */
+    --text: #EAF2EF;
+    --muted: #8DB8AE;
+    --live: #F4B942;       /* only for live moments: signing, spelling, just recognised */
+    --live-ink: #2A1E05;
+    --danger: #F08A7A;
+    --font: "Atkinson Hyperlegible", system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --ink: #EEF3F1; --deep: #D9E4E0; --panel: #FFFFFF; --line: #C9D9D4;
+      --text: #12302F; --muted: #4F746B; --live: #B97900; --live-ink: #FFFFFF; --danger: #B3402E;
+    }
+  }
+  :root[data-theme="light"] {
+    --ink: #EEF3F1; --deep: #D9E4E0; --panel: #FFFFFF; --line: #C9D9D4;
+    --text: #12302F; --muted: #4F746B; --live: #B97900; --live-ink: #FFFFFF; --danger: #B3402E;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--ink); color: var(--text); font-family: var(--font);
+    font-size: 17px; line-height: 1.45;
+  }
+  button { font: inherit; color: inherit; }
+  :focus-visible { outline: 3px solid var(--live); outline-offset: 2px; }
+
+  .app {
+    display: grid; grid-template-rows: auto 1fr; gap: 18px;
+    min-height: 100%; padding: 18px 24px 24px; max-width: 1680px; margin: 0 auto;
+  }
+
+  /* ── top bar ───────────────────────────────────────────── */
+  header { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+  .brand { font-size: 26px; font-weight: 700; letter-spacing: -0.01em; margin: 0; }
+  .brand small { font-weight: 400; color: var(--muted); font-size: 17px; margin-left: 10px; }
+  .status {
+    display: inline-flex; align-items: center; gap: 10px; padding: 7px 14px 7px 12px;
+    border-radius: 999px; border: 1px solid var(--line); color: var(--muted); font-size: 15px;
+  }
+  .status .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+  .status[data-s="signing"], .status[data-s="spelling"] { color: var(--text); border-color: var(--live); }
+  .status[data-s="signing"] .dot, .status[data-s="spelling"] .dot { background: var(--live); animation: pulse 1s ease-in-out infinite; }
+  .status[data-s="error"] { color: var(--danger); border-color: var(--danger); }
+  .status[data-s="error"] .dot { background: var(--danger); }
+  @keyframes pulse { 50% { transform: scale(1.5); opacity: .55; } }
+
+  .tools { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
+  .tool {
+    background: transparent; border: 1px solid var(--line); border-radius: 10px;
+    padding: 8px 14px; cursor: pointer; font-size: 15px; display: inline-flex; gap: 8px; align-items: center;
+  }
+  .tool:hover { border-color: var(--muted); }
+  .tool[aria-pressed="true"] { background: var(--text); color: var(--ink); border-color: var(--text); }
+  .tool kbd { font: inherit; font-size: 12px; color: var(--muted); border: 1px solid var(--line); border-radius: 5px; padding: 0 5px; }
+  .tool[aria-pressed="true"] kbd { color: var(--ink); border-color: var(--ink); }
+  .tool.primary { background: var(--live); color: var(--live-ink); border-color: var(--live); font-weight: 700; }
+  .tool.primary kbd { color: var(--live-ink); border-color: var(--live-ink); }
+  .tool:disabled { opacity: .4; cursor: not-allowed; }
+
+  /* ── main ──────────────────────────────────────────────── */
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 22px; min-height: 0; }
+
+  .stage { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .screen {
+    position: relative; aspect-ratio: 16 / 9; background: var(--deep);
+    border-radius: 18px; overflow: hidden; width: 100%;
+  }
+  .screen img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; }
+  .screen .notice {
+    position: absolute; inset: 0; display: grid; place-content: center; text-align: center;
+    padding: 24px; color: var(--muted); gap: 8px;
+  }
+  .screen .notice[hidden] { display: none; }
+  .screen .notice strong { color: var(--text); font-size: 20px; }
+  .screen .notice.error strong { color: var(--danger); }
+
+  /* caption band: the one loud thing on the page */
+  .caption {
+    position: absolute; left: 0; right: 0; bottom: 0; min-height: 30%;
+    display: flex; flex-direction: column; justify-content: flex-end; gap: 6px;
+    padding: 60px 40px 30px;
+    background: linear-gradient(to top, rgba(5,20,22,.92) 0%, rgba(5,20,22,.78) 55%, rgba(5,20,22,0) 100%);
+    color: #FFFFFF; pointer-events: none;
+    opacity: 0; transition: opacity .25s ease;
+  }
+  .caption.on { opacity: 1; }
+  .caption .words {
+    font-weight: 700; font-size: clamp(30px, 3.8vw, 60px); line-height: 1.1; letter-spacing: -0.01em;
+    display: flex; flex-wrap: wrap; align-items: center; gap: .28em;
+  }
+  .caption .sure { color: #BFD8D1; font-size: 16px; }
+  .caption .words.fresh { animation: rise .35s ease-out; }
+  @keyframes rise { from { transform: translateY(10px); opacity: 0; } }
+
+  .tiles { display: inline-flex; gap: .12em; }
+  .tile {
+    display: inline-grid; place-items: center; width: 1.05em; height: 1.2em;
+    border-radius: .16em; background: #F4B942; color: #2A1E05; font-size: .9em;
+    animation: land .28s cubic-bezier(.2,1.4,.4,1);
+  }
+  .tile.cursor { background: transparent; border: 3px dashed rgba(244,185,66,.8); animation: blink 1s steps(2) infinite; }
+  @keyframes land { from { transform: translateY(-.5em) scale(.6); opacity: 0; } }
+  @keyframes blink { 50% { opacity: .25; } }
+
+  .hint { color: var(--muted); font-size: 15px; margin: 0; }
+  .hint b { color: var(--text); font-weight: 700; }
+
+  /* ── side panel ───────────────────────────────────────── */
+  aside {
+    background: var(--panel); border-radius: 18px; border: 1px solid var(--line);
+    display: grid; grid-template-rows: auto minmax(0, 1fr); min-height: 0; overflow: hidden;
+  }
+  aside h2 { font-size: 18px; margin: 0; padding: 18px 20px 8px; font-weight: 700; }
+
+  .talk { list-style: none; margin: 0; padding: 4px 20px 16px; overflow-y: auto; min-height: 180px; }
+  .talk li { display: grid; grid-template-columns: 70px 1fr; gap: 10px; padding: 9px 0; border-top: 1px solid var(--line); }
+  .talk li:first-child { border-top: 0; }
+  .talk time { color: var(--muted); font-size: 14px; padding-top: 3px; font-variant-numeric: tabular-nums; }
+  .talk .said { font-size: 20px; font-weight: 700; line-height: 1.25; }
+  .talk .how { display: block; color: var(--muted); font-size: 14px; font-weight: 400; }
+  .talk li.new .said { animation: rise .35s ease-out; }
+  .talk li.empty { display: block; color: var(--muted); border: 0; padding: 10px 0; }
+
+
+  @media (min-width: 1081px) {
+    .app { height: 100vh; min-height: 560px; }
+    .screen { width: min(100%, calc((100vh - 150px) * 16 / 9)); }
+  }
+  @media (max-width: 1080px) {
+    main { grid-template-columns: 1fr; }
+    aside { grid-template-rows: auto auto; }
+    .talk { max-height: 320px; }
+  }
+  @media (max-width: 640px) {
+    .app { padding: 14px 16px 18px; }
+    .brand small { display: none; }
+    .tools { margin-left: 0; width: 100%; }
+    .tool kbd { display: none; }
+    .caption { padding: 40px 18px 16px; }
+    .screen { border-radius: 12px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1 class="brand">Sign2Text<small>ASL to English, live</small></h1>
+    <div class="status" id="status" data-s="starting" role="status" aria-live="polite">
+      <span class="dot"></span><span id="statusText">Starting the camera</span>
+    </div>
+    <div class="tools">
+      <button class="tool primary" id="spellBtn" type="button">Spell a name <kbd>S</kbd></button>
+      <button class="tool" id="voiceBtn" type="button" aria-pressed="false">Read aloud <kbd>V</kbd></button>
+      <button class="tool" id="handsBtn" type="button" aria-pressed="true">Hand lines <kbd>H</kbd></button>
+      <button class="tool" id="clearBtn" type="button">Clear <kbd>C</kbd></button>
+    </div>
+  </header>
+
+  <main>
+    <section class="stage" aria-label="Camera">
+      <div class="screen">
+        <img id="video" src="/video" alt="Live camera view of the signer">
+        <div class="notice" id="notice"><strong>Starting the camera</strong><span>This takes a few seconds.</span></div>
+        <div class="caption" id="caption" aria-live="polite">
+          <div class="words" id="words"></div>
+          <div class="sure" id="sure"></div>
+        </div>
+      </div>
+      <p class="hint" id="hint">Raise your hands to sign, then lower them. The words appear on the video and in the conversation.</p>
+    </section>
+
+    <aside>
+      <h2>Conversation</h2>
+      <ol class="talk" id="talk"><li class="empty">Nothing signed yet. Sign a phrase to start.</li></ol>
+    </aside>
+  </main>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const statusEl = $('status'), statusText = $('statusText'), notice = $('notice');
+  const caption = $('caption'), words = $('words'), sure = $('sure'), hint = $('hint');
+  const talk = $('talk');
+  const spellBtn = $('spellBtn'), voiceBtn = $('voiceBtn'), handsBtn = $('handsBtn'), clearBtn = $('clearBtn');
+
+  let ws, state = {}, lastCaptionId = null, lastSpell = '', lastTalkIds = new Set();
+  let voice = false;
+  try { voice = localStorage.getItem('s2t-voice') === '1'; } catch (e) {}
+  voiceBtn.setAttribute('aria-pressed', String(voice));
+
+  const STATUS = {
+    starting: 'Starting the camera',
+    ready: 'Ready. Raise your hands to sign',
+    signing: 'Signing',
+    spelling: 'Spelling a name. Hold each letter still',
+    error: 'Camera problem',
+  };
+  const pretty = p => {
+    let t = p.split(' ').map(w => w === 'i' ? 'I' : w).join(' ').replace(" i'", " I'");
+    return t.charAt(0).toUpperCase() + t.slice(1);
+  };
+
+  function connect() {
+    ws = new WebSocket(`ws://${location.host}/ws`);
+    ws.onmessage = e => render(JSON.parse(e.data));
+    ws.onclose = () => {
+      render({ status: 'error', error: 'Lost the connection to the demo. Is web_demo.py still running?' });
+      setTimeout(connect, 1500);
+    };
+  }
+  const send = cmd => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ cmd })); };
+
+  function render(s) {
+    state = s;
+    const st = s.status || 'starting';
+    statusEl.dataset.s = st;
+    statusText.textContent = st === 'error' ? 'Camera problem' : (STATUS[st] || st);
+
+    // notice over the video
+    if (st === 'error') {
+      notice.className = 'notice error';
+      notice.innerHTML = '<strong>The demo stopped</strong><span></span>';
+      notice.querySelector('span').textContent = s.error || '';
+      notice.hidden = false;
+    } else if (st === 'starting') {
+      notice.className = 'notice'; notice.hidden = false;
+    } else {
+      notice.hidden = true;
+    }
+
+    // caption band
+    const sp = s.spelling || {};
+    if (sp.active) {
+      words.innerHTML = '';
+      if (sp.prefix) { const pre = document.createElement('span'); pre.textContent = sp.prefix; words.append(pre); }
+      const tiles = document.createElement('span'); tiles.className = 'tiles';
+      const letters = sp.letters || '';
+      [...letters].forEach((ch, i) => {
+        const t = document.createElement('span'); t.className = 'tile'; t.textContent = ch;
+        if (i < lastSpell.length) t.style.animation = 'none';
+        tiles.append(t);
+      });
+      const cur = document.createElement('span'); cur.className = 'tile cursor'; cur.setAttribute('aria-hidden', 'true');
+      tiles.append(cur); words.append(tiles);
+      sure.textContent = 'Hold each letter still. Lower your hands when the name is done.';
+      caption.classList.add('on'); lastSpell = letters;
+    } else if (s.caption) {
+      if (s.caption.id !== lastCaptionId) {
+        words.textContent = s.caption.text;
+        words.classList.remove('fresh'); void words.offsetWidth; words.classList.add('fresh');
+        sure.textContent = s.caption.conf < 1 ? `${Math.round(s.caption.conf * 100)}% sure` : 'Fingerspelled';
+        lastCaptionId = s.caption.id;
+      }
+      caption.classList.add('on'); lastSpell = '';
+    } else {
+      caption.classList.remove('on'); lastSpell = '';
+    }
+
+    // conversation
+    const items = s.transcript || [];
+    if (!items.length) {
+      talk.innerHTML = '<li class="empty">Nothing signed yet. Sign a phrase to start.</li>';
+      lastTalkIds = new Set();
+    } else {
+      const fresh = [];
+      talk.innerHTML = '';
+      items.forEach(it => {
+        const li = document.createElement('li');
+        if (!lastTalkIds.has(it.id)) { li.className = 'new'; fresh.push(it); }
+        const t = document.createElement('time'); t.textContent = it.time;
+        const said = document.createElement('div'); said.className = 'said'; said.textContent = it.text;
+        if (it.kind === 'spelled') { const how = document.createElement('span'); how.className = 'how'; how.textContent = 'Name fingerspelled'; said.append(how); }
+        li.append(t, said); talk.append(li);
+      });
+      talk.scrollTop = talk.scrollHeight;
+      if (lastTalkIds.size) fresh.forEach(it => speak(it.text));
+      lastTalkIds = new Set(items.map(it => it.id));
+    }
+
+    spellBtn.disabled = !s.can_spell || sp.active;
+    handsBtn.setAttribute('aria-pressed', String(s.show_hands !== false));
+    hint.innerHTML = sp.active
+      ? 'Spelling: hold each letter for half a second. For a double letter, bounce your hand slightly.'
+      : 'Raise your hands to sign, then lower them. To say your name, sign <b>my name is</b>, lower your hands, then fingerspell it.';
+  }
+
+  function speak(text) {
+    if (!voice || !('speechSynthesis' in window)) return;
+    const u = new SpeechSynthesisUtterance(text); u.lang = 'en-US'; u.rate = 1;
+    speechSynthesis.speak(u);
+  }
+
+  spellBtn.onclick = () => send('spell');
+  clearBtn.onclick = () => send('clear');
+  handsBtn.onclick = () => send('hands');
+  voiceBtn.onclick = () => {
+    voice = !voice; voiceBtn.setAttribute('aria-pressed', String(voice));
+    try { localStorage.setItem('s2t-voice', voice ? '1' : '0'); } catch (e) {}
+    if (voice) speak('Read aloud is on');
+  };
+  document.addEventListener('keydown', e => {
+    if (e.ctrlKey || e.metaKey || e.altKey || e.target.closest('input,textarea')) return;
+    const k = e.key.toLowerCase();
+    if (k === 's' && !spellBtn.disabled) spellBtn.click();
+    else if (k === 'c') clearBtn.click();
+    else if (k === 'h') handsBtn.click();
+    else if (k === 'v') voiceBtn.click();
+  });
+  $('video').onerror = () => setTimeout(() => { $('video').src = '/video?' + Date.now(); }, 1000);
+
+  connect();
+})();
+</script>
+</body>
+</html>
